@@ -1,0 +1,9 @@
+{
+  "dependencies": {
+    "chalk": "^5.4.1",
+    "dotenv": "^16.4.7",
+    "googleapis": "^148.0.0",
+    "inquirer": "^12.5.0",
+    "youtube-dl-exec": "^3.0.20"
+  }
+}
