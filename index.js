@@ -255,7 +255,28 @@ async function processAudioWithMoises(filePath, jobName) {
 
       const resultPaths = await moises.downloadJobResults(job, jobOutputDir);
       console.log(chalk.green(`Resultados descargados en: ${jobOutputDir}`));
-      console.log(chalk.dim(`Archivos: ${resultPaths.join(", ")}`));
+
+      // *** DEBUGGING: Loguear el valor y tipo de resultPaths ***
+      console.log(chalk.yellow("[DEBUG] Valor de resultPaths:"), resultPaths);
+      console.log(
+        chalk.yellow("[DEBUG] Tipo de resultPaths:"),
+        typeof resultPaths
+      );
+
+      // *** CORRECCIÓN: Comprobar si es un array antes de usar .join() ***
+      if (Array.isArray(resultPaths)) {
+        console.log(chalk.dim(`Archivos: ${resultPaths.join(", ")}`));
+      } else if (resultPaths) {
+        // Si no es array pero tiene valor, mostrarlo directamente
+        console.log(chalk.dim(`Archivo: ${resultPaths}`));
+      } else {
+        // Si es undefined, null, o similar
+        console.log(
+          chalk.yellow(
+            "No se pudo determinar la lista de archivos descargados."
+          )
+        );
+      }
 
       // (Opcional) Limpiar el job del servidor de Moises
       try {
@@ -278,10 +299,16 @@ async function processAudioWithMoises(filePath, jobName) {
     }
   } catch (error) {
     console.error(chalk.red("\nError durante el procesamiento con Moises:"));
-    if (error.message) {
-      console.error(chalk.red(`  ${error.message}`));
+    // Mostrar el error original si existe y tiene message, sino el objeto completo
+    if (error && error.message) {
+      // Evitar mostrar el error "resultPaths.join is not a function" ya que lo manejamos ahora
+      if (!error.message.includes("resultPaths.join is not a function")) {
+        console.error(chalk.red(`  ${error.message}`));
+      }
+    } else if (error) {
+      console.error(chalk.red("  Ocurrió un error inesperado:"), error);
     } else {
-      console.error(chalk.red("  Ocurrió un error inesperado."), error);
+      console.error(chalk.red("  Ocurrió un error inesperado."));
     }
     console.error(
       chalk.yellow("  Verifica tu API Key de Moises y la conexión a internet.")
