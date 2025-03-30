@@ -9,6 +9,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import chalk from "chalk"; // Para mejorar la salida en consola
 import Moises from "moises/sdk.js"; // <--- Importar SDK de Moises
+import player from "play-sound"; // <--- Importar para reproducir audio
 
 // Configuración inicial
 dotenv.config();
@@ -16,6 +17,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const DOWNLOADS_DIR = path.join(__dirname, "downloads");
 const PROCESSED_DIR = path.join(DOWNLOADS_DIR, "processed_stems"); // Carpeta para resultados de Moises
+const audioPlayer = player({}); // Inicializar play-sound una vez
 
 // Asegurarse de que los directorios existan
 if (!fs.existsSync(DOWNLOADS_DIR)) {
@@ -278,6 +280,106 @@ async function processAudioWithMoises(filePath, jobName) {
         );
       }
 
+      // Leer workflow.result.json para encontrar los stems de batería
+      const resultJsonPath = path.join(jobOutputDir, "workflow.result.json");
+      let drumWavFiles = [];
+      if (fs.existsSync(resultJsonPath)) {
+        try {
+          const resultJson = JSON.parse(
+            fs.readFileSync(resultJsonPath, "utf-8")
+          );
+          // Asumir que todos los valores terminados en .wav son stems de batería relevantes
+          drumWavFiles = Object.values(resultJson)
+            .filter(
+              (val) =>
+                typeof val === "string" && val.toLowerCase().endsWith(".wav")
+            )
+            .map((relativePath) =>
+              path.join(jobOutputDir, path.basename(relativePath))
+            ); // Usar basename para asegurar que sea el archivo correcto en jobOutputDir
+          console.log(
+            chalk.yellow("[DEBUG] Archivos WAV encontrados en JSON:"),
+            drumWavFiles
+          );
+        } catch (jsonError) {
+          console.warn(
+            chalk.yellow(
+              `No se pudo leer o parsear ${resultJsonPath}: ${jsonError.message}`
+            )
+          );
+        }
+      } else {
+        console.warn(
+          chalk.yellow(
+            `No se encontró ${resultJsonPath}. No se puede determinar qué archivos combinar.`
+          )
+        );
+        // Fallback: buscar todos los .wav en el directorio si el JSON no está o falla
+        try {
+          drumWavFiles = fs
+            .readdirSync(jobOutputDir)
+            .filter(
+              (file) =>
+                file.toLowerCase().endsWith(".wav") &&
+                file !== "combined_drums.wav"
+            ) // Excluir el combinado si ya existe
+            .map((file) => path.join(jobOutputDir, file));
+          if (drumWavFiles.length > 0) {
+            console.log(
+              chalk.yellow(
+                "[DEBUG] Archivos WAV encontrados por escaneo de directorio:"
+              ),
+              drumWavFiles
+            );
+          } else {
+            console.log(
+              chalk.yellow("No se encontraron archivos .wav en el directorio.")
+            );
+          }
+        } catch (readDirError) {
+          console.warn(
+            chalk.yellow(
+              `Error leyendo el directorio ${jobOutputDir}: ${readDirError.message}`
+            )
+          );
+        }
+      }
+
+      // Preguntar al usuario si quiere escuchar
+      if (drumWavFiles.length > 1) {
+        const { shouldPlay } = await inquirer.prompt([
+          {
+            type: "confirm",
+            name: "shouldPlay",
+            message: `Se encontraron ${drumWavFiles.length} stems de batería. ¿Quieres combinarlos y escucharlos ahora? (Necesitas ffmpeg instalado y un reproductor de audio compatible)`,
+            default: false,
+          },
+        ]);
+        if (shouldPlay) {
+          await combineAndPlayAudio(drumWavFiles, jobOutputDir);
+        }
+      } else if (drumWavFiles.length === 1) {
+        const { shouldPlaySingle } = await inquirer.prompt([
+          {
+            type: "confirm",
+            name: "shouldPlaySingle",
+            message: `Se encontró 1 stem de batería (${path.basename(
+              drumWavFiles[0]
+            )}). ¿Quieres escucharlo ahora? (Necesitas un reproductor de audio compatible)`,
+            default: false,
+          },
+        ]);
+        if (shouldPlaySingle) {
+          await playAudioFile(drumWavFiles[0]);
+        }
+      } else {
+        console.log(
+          chalk.yellow(
+            "No se encontraron archivos de batería (.wav) para reproducir."
+          )
+        );
+      }
+
       // (Opcional) Limpiar el job del servidor de Moises
       try {
         await moises.deleteJob(jobId);
@@ -319,6 +421,165 @@ async function processAudioWithMoises(filePath, jobName) {
     // No relanzamos el error para que el script principal pueda continuar si es posible
   }
   console.log(chalk.cyan("--- Fin del procesamiento con Music AI ---"));
+}
+
+// --- Nueva Función ---
+/**
+ * Combina archivos WAV usando ffmpeg y los reproduce.
+ * @param {string[]} wavFiles - Lista de rutas absolutas a los archivos WAV a combinar.
+ * @param {string} outputDir - Directorio donde guardar el archivo combinado.
+ */
+async function combineAndPlayAudio(wavFiles, outputDir) {
+  const combinedFileName = "combined_drums.wav";
+  const combinedOutputPath = path.join(outputDir, combinedFileName);
+
+  // Asegurarse de que los archivos existen antes de intentar combinarlos
+  const existingWavFiles = wavFiles.filter((file) => fs.existsSync(file));
+  if (existingWavFiles.length === 0) {
+    console.error(
+      chalk.red(
+        "No se encontraron los archivos WAV especificados para combinar."
+      )
+    );
+    return;
+  }
+  if (existingWavFiles.length < wavFiles.length) {
+    console.warn(
+      chalk.yellow(
+        "Advertencia: Algunos archivos WAV no se encontraron y no serán incluidos en la mezcla."
+      )
+    );
+  }
+  if (existingWavFiles.length < 2) {
+    console.warn(
+      chalk.yellow(
+        "Se necesita al menos 2 archivos WAV para combinar. Reproduciendo el único archivo encontrado..."
+      )
+    );
+    await playAudioFile(existingWavFiles[0]);
+    return;
+  }
+
+  const inputArgs = existingWavFiles.map((file) => `-i "${file}"`).join(" ");
+  const filterComplex = `amix=inputs=${existingWavFiles.length}:duration=longest`;
+  // Usamos -y para sobrescribir el archivo combinado si ya existe
+  const command = `ffmpeg ${inputArgs} -filter_complex "${filterComplex}" -y "${combinedOutputPath}"`;
+
+  console.log(chalk.blue("\\nCombinando archivos de batería con ffmpeg..."));
+  console.log(chalk.dim(`Comando: ${command}`));
+
+  try {
+    await new Promise((resolve, reject) => {
+      const ffmpegProcess = exec(command, (error, stdout, stderr) => {
+        // Mostrar stderr (ffmpeg a menudo lo usa para info/progreso)
+        if (stderr) {
+          process.stdout.write(chalk.gray(stderr));
+        }
+        // Mostrar stdout si hay algo
+        if (stdout) {
+          process.stdout.write(chalk.gray(stdout));
+        }
+        // Rechazar si hubo un error en la ejecución
+        if (error) {
+          // Intentar detectar si el error es que ffmpeg no se encontró
+          if (
+            error.message.includes("ENOENT") ||
+            error.message.toLowerCase().includes("not found")
+          ) {
+            return reject(
+              new Error(
+                `Comando ffmpeg no encontrado. Asegúrate de que ffmpeg esté instalado y en tu PATH. (${error.message})`
+              )
+            );
+          }
+          return reject(
+            new Error(
+              `ffmpeg falló con código ${error.code}. (${error.message})`
+            )
+          );
+        }
+        resolve(); // Resolver si no hubo error
+      });
+
+      ffmpegProcess.on("error", (err) => {
+        // Manejar errores al intentar iniciar el proceso
+        // Este error suele ser 'spawn ENOENT', indicando que el comando no se encontró
+        if (
+          err.message.includes("ENOENT") ||
+          err.message.toLowerCase().includes("not found")
+        ) {
+          reject(
+            new Error(
+              `Comando ffmpeg no encontrado. Asegúrate de que ffmpeg esté instalado y en tu PATH. (${err.message})`
+            )
+          );
+        } else {
+          reject(new Error(`Error ejecutando ffmpeg: ${err.message}`));
+        }
+      });
+    });
+
+    console.log(
+      chalk.green(`\\n¡Archivos combinados con éxito en ${combinedOutputPath}!`)
+    );
+
+    // Si la combinación fue exitosa, reproducir
+    await playAudioFile(combinedOutputPath);
+  } catch (error) {
+    console.error(chalk.red(`\\nError combinando los archivos de batería:`));
+    console.error(chalk.red(`  ${error.message}`));
+    // Ya se incluye el mensaje sobre instalar ffmpeg en el propio error
+  }
+}
+
+// --- Nueva Función Auxiliar ---
+/**
+ * Reproduce un archivo de audio usando play-sound.
+ * @param {string} audioFilePath - Ruta absoluta al archivo de audio.
+ */
+async function playAudioFile(audioFilePath) {
+  if (!fs.existsSync(audioFilePath)) {
+    console.error(
+      chalk.red(
+        `Error: El archivo de audio a reproducir no existe: ${audioFilePath}`
+      )
+    );
+    return;
+  }
+  console.log(
+    chalk.blue(`\nIntentando reproducir: ${path.basename(audioFilePath)}...`)
+  );
+
+  try {
+    await new Promise((resolve, reject) => {
+      audioPlayer.play(audioFilePath, (err) => {
+        if (err) {
+          // Intentar dar un mensaje más útil si no se encuentra el reproductor
+          if (
+            err.message &&
+            (err.message.includes("Couldn't find a suitable audio player") ||
+              err.message.toLowerCase().includes("no such file") ||
+              err.code === "ENOENT")
+          ) {
+            reject(
+              new Error(
+                `No se encontró un reproductor de audio compatible (como afplay, mplayer, vlc, aplay) o el archivo/comando no existe. (${err.message})`
+              )
+            );
+          } else {
+            reject(err); // Otro error durante la reproducción
+          }
+        } else {
+          console.log(chalk.green("Reproducción finalizada."));
+          resolve();
+        }
+      });
+    });
+  } catch (playError) {
+    console.error(chalk.red(`\nError reproduciendo el archivo de audio:`));
+    console.error(chalk.red(`  ${playError.message}`));
+    // El mensaje de error ya sugiere instalar un reproductor compatible
+  }
 }
 
 /**
