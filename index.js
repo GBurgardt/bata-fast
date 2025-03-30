@@ -84,6 +84,72 @@ const MOISES_WORKFLOW_DRUMS = "isolate_drums_bata"; // Workflow para extraer bat
 // --- Funciones ---
 
 /**
+ * Formatea segundos a MM:SS.
+ * @param {number} totalSeconds
+ * @returns {string} Tiempo formateado.
+ */
+function formatTime(totalSeconds) {
+  if (isNaN(totalSeconds) || totalSeconds < 0) {
+    return "??:??";
+  }
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = Math.floor(totalSeconds % 60);
+  return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(
+    2,
+    "0"
+  )}`;
+}
+
+/**
+ * Obtiene la duración de un archivo de audio usando ffprobe.
+ * @param {string} filePath
+ * @returns {Promise<number | null>} Duración en segundos o null si falla.
+ */
+async function getAudioDuration(filePath) {
+  // Comando ffprobe para obtener duración
+  const command = `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${filePath}"`;
+  logDebug("Ejecutando ffprobe para obtener duración:", command);
+  return new Promise((resolve) => {
+    exec(command, (error, stdout, stderr) => {
+      if (error) {
+        logDebug("Error ejecutando ffprobe:", stderr || error.message);
+        if (
+          error.message.includes("ENOENT") ||
+          error.message.toLowerCase().includes("not found")
+        ) {
+          console.warn(
+            chalk.yellow(
+              "Advertencia: ffprobe no encontrado. No se mostrará la duración del audio. Asegúrate de que ffmpeg esté instalado."
+            )
+          );
+        } else {
+          console.warn(
+            chalk.yellow(
+              "Advertencia: No se pudo obtener la duración del audio."
+            )
+          );
+        }
+        resolve(null); // No fallar, solo devolver null
+        return;
+      }
+      const duration = parseFloat(stdout.trim());
+      if (isNaN(duration)) {
+        logDebug("ffprobe devolvió una duración no válida:", stdout);
+        console.warn(
+          chalk.yellow(
+            "Advertencia: No se pudo parsear la duración del audio devuelta por ffprobe."
+          )
+        );
+        resolve(null);
+      } else {
+        logDebug("Duración obtenida (segundos):", duration);
+        resolve(duration);
+      }
+    });
+  });
+}
+
+/**
  * Busca videos en YouTube usando la API.
  * @param {string} query Término de búsqueda.
  * @param {number} maxResults Número máximo de resultados.
@@ -521,7 +587,7 @@ async function combineAndPlayAudio(wavFiles, outputDir) {
 
 // --- Nueva Función Auxiliar ---
 /**
- * Reproduce un archivo de audio usando play-sound.
+ * Reproduce un archivo de audio usando play-sound y muestra progreso simulado.
  * @param {string} audioFilePath - Ruta absoluta al archivo de audio.
  */
 async function playAudioFile(audioFilePath) {
@@ -533,19 +599,51 @@ async function playAudioFile(audioFilePath) {
     );
     return;
   }
-  console.log(
-    chalk.blue(
-      `\nReproduciendo: ${path.basename(
-        audioFilePath
-      )}... (Presiona Ctrl+C para detener)`
-    )
-  );
+
+  const baseName = path.basename(audioFilePath);
+  let duration = null;
+  let progressInterval = null; // Guardar la referencia al intervalo
 
   try {
-    await new Promise((resolve, reject) => {
+    // Intentar obtener duración primero
+    duration = await getAudioDuration(audioFilePath);
+    const durationStr = duration ? formatTime(duration) : "??:??";
+
+    // Mensaje inicial (será sobrescrito si hay progreso)
+    process.stdout.write(
+      chalk.blue(
+        `\n▶️ Reproduciendo: ${baseName} [00:00 / ${durationStr}] (Ctrl+C para detener)`
+      )
+    );
+
+    // Iniciar reproducción
+    const playPromise = new Promise((resolve, reject) => {
+      const startTime = Date.now();
+
+      // Iniciar intervalo de progreso si tenemos duración
+      if (duration) {
+        progressInterval = setInterval(() => {
+          const elapsedSeconds = (Date.now() - startTime) / 1000;
+          // No exceder la duración total en el display
+          const currentSeconds = Math.min(elapsedSeconds, duration);
+          const currentTimeStr = formatTime(currentSeconds);
+          // Usar \r para volver al inicio de la línea y sobrescribir
+          process.stdout.write(
+            chalk.blue(
+              `\r▶️ Reproduciendo: ${baseName} [${currentTimeStr} / ${durationStr}] (Ctrl+C para detener) `
+            )
+          ); // Espacio extra al final
+        }, 1000); // Actualizar cada segundo
+      }
+
       const audioProcess = audioPlayer.play(audioFilePath, (err) => {
+        clearInterval(progressInterval); // Detener intervalo al terminar/error
+        // Limpiar la línea de progreso antes de mostrar el mensaje final o error
+        process.stdout.write(
+          "\r" + " ".repeat(process.stdout.columns - 1) + "\r"
+        );
+
         if (err) {
-          // Simplificar error si no estamos en debug
           let errorMsg = err.message;
           if (
             !debugMode &&
@@ -558,37 +656,54 @@ async function playAudioFile(audioFilePath) {
           }
           reject(new Error(errorMsg));
         } else {
-          // La reproducción puede terminar inmediatamente si se lanza en segundo plano
-          // No marcamos como finalizada aquí, el usuario debe detenerla o esperar
+          console.log(chalk.green(`⏹️ Reproducción finalizada: ${baseName}`));
           resolve();
         }
       });
 
-      // Loguear si el proceso de audio termina o da error (útil en debug)
       if (audioProcess) {
         audioProcess.on("close", (code) => {
           logDebug(`Proceso de audio terminado con código: ${code}`);
-          console.log(chalk.green("Reproducción finalizada."));
+          // Ya manejamos la finalización en el callback de play()
+          // resolve(); No resolver aquí para evitar doble mensaje
         });
         audioProcess.on("error", (error) => {
+          clearInterval(progressInterval); // Detener intervalo en error del proceso
+          process.stdout.write(
+            "\r" + " ".repeat(process.stdout.columns - 1) + "\r"
+          ); // Limpiar línea
           logDebug(`Error en proceso de audio: ${error}`);
           reject(
             new Error(`Error en el reproductor de audio: ${error.message}`)
           );
         });
       } else {
-        // Si play() no devuelve un proceso (raro), resolver para no bloquear
+        clearInterval(progressInterval); // Detener si no hay proceso
+        process.stdout.write(
+          "\r" + " ".repeat(process.stdout.columns - 1) + "\r"
+        ); // Limpiar línea
         logDebug("play-sound no devolvió un proceso hijo.");
-        resolve();
+        reject(new Error("No se pudo iniciar el proceso de reproducción."));
       }
     });
+
+    await playPromise;
   } catch (playError) {
-    console.error(chalk.red(`\nError reproduciendo el archivo de audio:`));
+    if (progressInterval) clearInterval(progressInterval); // Asegurarse de limpiar el intervalo en cualquier error
+    process.stdout.write("\r" + " ".repeat(process.stdout.columns - 1) + "\r"); // Limpiar línea en caso de error
+    console.error(chalk.red(`\n❌ Error reproduciendo el archivo de audio:`));
     console.error(chalk.red(`  ${playError.message}`));
     if (!debugMode && playError.message.includes("compatible")) {
       console.error(
         chalk.yellow(
           "  Asegúrate de tener un reproductor como 'afplay' (macOS) o 'mplayer'/'aplay' (Linux) instalado."
+        )
+      );
+    }
+    if (!debugMode && playError.message.includes("ffprobe")) {
+      console.error(
+        chalk.yellow(
+          "  Asegúrate de tener 'ffmpeg' (que incluye ffprobe) instalado y en tu PATH para ver la duración."
         )
       );
     }
