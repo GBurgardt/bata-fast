@@ -345,13 +345,29 @@ async function processAudioWithMoises(filePath, jobName) {
         }
       }
 
+      // *** FILTRADO: Excluir 'Other.wav' (y 'combined_drums.wav' por si acaso) ***
+      drumWavFiles = drumWavFiles.filter((file) => {
+        const fileNameLower = path.basename(file).toLowerCase();
+        return (
+          fileNameLower !== "other.wav" &&
+          fileNameLower !== "combined_drums.wav"
+        );
+      });
+
+      console.log(
+        chalk.yellow(
+          "[DEBUG] Archivos WAV de batería filtrados (para combinar/reproducir):"
+        ),
+        drumWavFiles
+      );
+
       // Preguntar al usuario si quiere escuchar
       if (drumWavFiles.length > 1) {
         const { shouldPlay } = await inquirer.prompt([
           {
             type: "confirm",
             name: "shouldPlay",
-            message: `Se encontraron ${drumWavFiles.length} stems de batería. ¿Quieres combinarlos y escucharlos ahora? (Necesitas ffmpeg instalado y un reproductor de audio compatible)`,
+            message: `Se encontraron ${drumWavFiles.length} stems de batería relevantes. ¿Quieres combinarlos y escucharlos ahora? (Necesitas ffmpeg instalado y un reproductor de audio compatible)`,
             default: false,
           },
         ]);
@@ -363,7 +379,7 @@ async function processAudioWithMoises(filePath, jobName) {
           {
             type: "confirm",
             name: "shouldPlaySingle",
-            message: `Se encontró 1 stem de batería (${path.basename(
+            message: `Se encontró 1 stem de batería relevante (${path.basename(
               drumWavFiles[0]
             )}). ¿Quieres escucharlo ahora? (Necesitas un reproductor de audio compatible)`,
             default: false,
@@ -375,7 +391,7 @@ async function processAudioWithMoises(filePath, jobName) {
       } else {
         console.log(
           chalk.yellow(
-            "No se encontraron archivos de batería (.wav) para reproducir."
+            "No se encontraron archivos de batería (.wav) relevantes para reproducir o combinar."
           )
         );
       }
@@ -426,46 +442,39 @@ async function processAudioWithMoises(filePath, jobName) {
 // --- Nueva Función ---
 /**
  * Combina archivos WAV usando ffmpeg y los reproduce.
- * @param {string[]} wavFiles - Lista de rutas absolutas a los archivos WAV a combinar.
+ * @param {string[]} wavFiles - Lista de rutas absolutas a los archivos WAV a combinar (ya filtrados).
  * @param {string} outputDir - Directorio donde guardar el archivo combinado.
  */
 async function combineAndPlayAudio(wavFiles, outputDir) {
   const combinedFileName = "combined_drums.wav";
   const combinedOutputPath = path.join(outputDir, combinedFileName);
 
-  // Asegurarse de que los archivos existen antes de intentar combinarlos
-  const existingWavFiles = wavFiles.filter((file) => fs.existsSync(file));
-  if (existingWavFiles.length === 0) {
-    console.error(
-      chalk.red(
-        "No se encontraron los archivos WAV especificados para combinar."
-      )
-    );
+  // La lista wavFiles ya viene filtrada y verificada en la función llamadora
+  if (wavFiles.length === 0) {
+    console.error(chalk.red("No hay archivos WAV válidos para combinar."));
     return;
   }
-  if (existingWavFiles.length < wavFiles.length) {
+  if (wavFiles.length === 1) {
     console.warn(
       chalk.yellow(
-        "Advertencia: Algunos archivos WAV no se encontraron y no serán incluidos en la mezcla."
+        "Solo hay 1 archivo WAV relevante. Reproduciendo directamente..."
       )
     );
-  }
-  if (existingWavFiles.length < 2) {
-    console.warn(
-      chalk.yellow(
-        "Se necesita al menos 2 archivos WAV para combinar. Reproduciendo el único archivo encontrado..."
-      )
-    );
-    await playAudioFile(existingWavFiles[0]);
+    await playAudioFile(wavFiles[0]);
     return;
   }
 
-  const inputArgs = existingWavFiles.map((file) => `-i "${file}"`).join(" ");
-  const filterComplex = `amix=inputs=${existingWavFiles.length}:duration=longest`;
+  const inputArgs = wavFiles.map((file) => `-i "${file}"`).join(" ");
+  const filterComplex = `amix=inputs=${wavFiles.length}:duration=longest`;
   // Usamos -y para sobrescribir el archivo combinado si ya existe
   const command = `ffmpeg ${inputArgs} -filter_complex "${filterComplex}" -y "${combinedOutputPath}"`;
 
-  console.log(chalk.blue("\\nCombinando archivos de batería con ffmpeg..."));
+  console.log(chalk.blue("\nCombinando archivos de batería con ffmpeg..."));
+  console.log(
+    chalk.dim(
+      `Archivos a combinar: ${wavFiles.map((f) => path.basename(f)).join(", ")}`
+    )
+  );
   console.log(chalk.dim(`Comando: ${command}`));
 
   try {
@@ -520,13 +529,13 @@ async function combineAndPlayAudio(wavFiles, outputDir) {
     });
 
     console.log(
-      chalk.green(`\\n¡Archivos combinados con éxito en ${combinedOutputPath}!`)
+      chalk.green(`\n¡Archivos combinados con éxito en ${combinedOutputPath}!`)
     );
 
     // Si la combinación fue exitosa, reproducir
     await playAudioFile(combinedOutputPath);
   } catch (error) {
-    console.error(chalk.red(`\\nError combinando los archivos de batería:`));
+    console.error(chalk.red(`\nError combinando los archivos de batería:`));
     console.error(chalk.red(`  ${error.message}`));
     // Ya se incluye el mensaje sobre instalar ffmpeg en el propio error
   }
