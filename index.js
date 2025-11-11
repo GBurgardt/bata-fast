@@ -34,6 +34,37 @@ const logDebug = (...args) => {
   }
 };
 
+/**
+ * Recorta texto demasiado largo para loguear sin saturar la consola.
+ * @param {string|number|undefined|null} value
+ * @param {number} maxLength
+ */
+const trimForLog = (value, maxLength = 600) => {
+  if (value === undefined || value === null) {
+    return "<vacío>";
+  }
+  const str = typeof value === "string" ? value : String(value);
+  if (str.length <= maxLength) {
+    return str;
+  }
+  return `${str.slice(0, maxLength)}... (truncado, total ${str.length} chars)`;
+};
+
+/**
+ * Registro estructurado de etapas para seguir el flujo y errores específicos.
+ * @param {string} label
+ * @param {string} message
+ * @param {any} [payload]
+ */
+const logStage = (label, message, payload) => {
+  const prefix = chalk.magenta(`[${label}]`);
+  if (payload !== undefined) {
+    console.log(prefix, message, payload);
+  } else {
+    console.log(prefix, message);
+  }
+};
+
 // Asegurarse de que los directorios existan
 if (!fs.existsSync(DOWNLOADS_DIR)) {
   console.log(
@@ -156,7 +187,7 @@ async function getAudioDuration(filePath) {
  * @returns {Promise<Array<{videoId: string, title: string}>>} Lista de videos encontrados.
  */
 async function searchVideos(query, maxResults = 5) {
-  console.log(chalk.blue(`\nBuscando videos para: "${query}"...`));
+  logStage("YOUTUBE", `Ejecutando búsqueda: "${query}" (max ${maxResults})`);
   try {
     const response = await youtube.search.list({
       part: ["snippet"],
@@ -180,6 +211,13 @@ async function searchVideos(query, maxResults = 5) {
     return items.filter((item) => item.videoId && item.title);
   } catch (error) {
     console.error(chalk.red("\nError buscando videos en YouTube:"));
+    logStage(
+      "YOUTUBE-ERROR",
+      "Detalles",
+      trimForLog(
+        error.response?.data?.error?.message || error.message || "sin mensaje"
+      )
+    );
     if (debugMode) {
       if (error.response?.data?.error?.message) {
         console.error(
@@ -218,7 +256,9 @@ async function downloadVideoAudio(videoId, title) {
     .substring(0, 100); // Limitar longitud y caracteres inválidos
   const outputPath = path.join(DOWNLOADS_DIR, `${safeTitle}.mp3`);
 
-  console.log(chalk.blue(`\nDescargando audio para: "${title}"...`));
+  logStage("DOWNLOAD", `Iniciando descarga de "${title}" (${videoId})`);
+  logStage("DOWNLOAD", "videoUrl", videoUrl);
+  logStage("DOWNLOAD", "Salida esperada", outputPath);
   logDebug(`URL: ${videoUrl}`);
   logDebug(`Guardando en: ${outputPath}`);
 
@@ -227,12 +267,16 @@ async function downloadVideoAudio(videoId, title) {
   const command = `yt-dlp -x --audio-format mp3 --output "${outputPath}" --no-check-certificates --no-warnings --force-ipv4 "${videoUrl}"`;
   logDebug(`Ejecutando comando: ${command}\n`);
 
+  const stdoutChunks = [];
+  const stderrChunks = [];
+
   return new Promise((resolve) => {
     // Cambiado para resolver con outputPath o null
     const downloadProcess = exec(command);
 
     // Mostrar progreso de yt-dlp (es bastante útil)
     downloadProcess.stdout?.on("data", (data) => {
+      stdoutChunks.push(data.toString());
       // Filtrar algunos mensajes menos útiles si no estamos en debug
       if (
         debugMode ||
@@ -245,9 +289,12 @@ async function downloadVideoAudio(videoId, title) {
 
     // Mostrar errores detallados solo en modo debug
     downloadProcess.stderr?.on("data", (data) => {
+      const stderrText = data.toString();
+      stderrChunks.push(stderrText);
       if (debugMode) {
         // En modo debug, mostrar todo stderr (incluso mensajes informativos)
-        process.stderr.write(chalk.redBright(data));
+        process.stderr.write(chalk.redBright(stderrText));
+        logStage("DOWNLOAD-STDERR", trimForLog(stderrText));
       } else {
         // En modo normal, intentar mostrar solo errores reales de stderr, no progreso
         if (
@@ -255,18 +302,31 @@ async function downloadVideoAudio(videoId, title) {
           !data.includes("[ExtractAudio]") &&
           !data.includes("[download]") // Filtrar líneas de progreso que a veces van a stderr
         ) {
-          process.stderr.write(chalk.red(data));
+          process.stderr.write(chalk.red(stderrText));
+          logStage("DOWNLOAD-STDERR", trimForLog(stderrText));
         }
       }
     });
 
     downloadProcess.on("close", (code) => {
+      logStage("DOWNLOAD", `yt-dlp finalizó con código ${code}`);
+      logStage(
+        "DOWNLOAD-TRACE",
+        "Stdout acumulado",
+        trimForLog(stdoutChunks.join("").trim())
+      );
+      logStage(
+        "DOWNLOAD-TRACE",
+        "Stderr acumulado",
+        trimForLog(stderrChunks.join("").trim())
+      );
       if (code === 0) {
         console.log(
           chalk.green(
             `\n¡Descarga completada! Archivo guardado en ${outputPath}`
           )
         );
+        logStage("DOWNLOAD", "Archivo final", outputPath);
         resolve(outputPath); // <--- Resuelve con la ruta del archivo
       } else {
         console.error(
@@ -306,28 +366,34 @@ async function downloadVideoAudio(videoId, title) {
  * @returns {Promise<void>}
  */
 async function processAudioWithMoises(filePath, jobName) {
+  logStage("MOISES", "--- Iniciando procesamiento con Music AI (Moises) ---");
   console.log(
     chalk.cyan("\n--- Iniciando procesamiento con Music AI (Moises) ---")
   );
 
   try {
     // 1. Subir archivo a Moises
+    logStage("MOISES", "Subiendo archivo", filePath);
     console.log(chalk.blue(`Subiendo archivo: ${path.basename(filePath)}...`));
     const downloadUrl = await moises.uploadFile(filePath);
     console.log(chalk.green("Archivo subido con éxito."));
     logDebug(`URL temporal: ${downloadUrl}`);
 
     // 2. Crear el Job
+    logStage("MOISES", "Creando job", jobName);
     console.log(chalk.blue(`Creando job en Moises para extraer batería...`));
     logDebug(`Workflow: ${MOISES_WORKFLOW_DRUMS}`);
     const jobId = await moises.addJob(jobName, MOISES_WORKFLOW_DRUMS, {
       inputUrl: downloadUrl,
     });
+    logStage("MOISES", "Job creado", jobId);
     console.log(chalk.green(`Job creado con ID: ${jobId}`));
 
     // 3. Esperar a que el Job se complete
+    logStage("MOISES", "Esperando finalización del job");
     console.log(chalk.blue("Procesando audio con IA (esto puede tardar)..."));
     const job = await moises.waitForJobCompletion(jobId);
+    logStage("MOISES", "Job completado", job.status);
 
     // 4. Revisar resultado y descargar
     if (job.status === "SUCCEEDED") {
@@ -344,7 +410,20 @@ async function processAudioWithMoises(filePath, jobName) {
       }
 
       await moises.downloadJobResults(job, jobOutputDir);
+      logStage("MOISES", "Resultados descargados en", jobOutputDir);
       console.log(chalk.green(`Resultados descargados en: ${jobOutputDir}`));
+
+      logStage(
+        "MOISES",
+        "Resumen job",
+        trimForLog(
+          JSON.stringify({
+            jobId,
+            status: job.status,
+            outputDir: jobOutputDir,
+          })
+        )
+      );
 
       const resultJsonPath = path.join(jobOutputDir, "workflow.result.json");
       let potentialDrumFiles = [];
@@ -415,6 +494,7 @@ async function processAudioWithMoises(filePath, jobName) {
       });
 
       logDebug("[DEBUG] Archivos WAV de batería filtrados:", drumWavFiles);
+      logStage("MOISES", "Stems de batería seleccionados", drumWavFiles);
 
       // Preguntar al usuario si quiere escuchar
       if (drumWavFiles.length > 1) {
@@ -453,6 +533,7 @@ async function processAudioWithMoises(filePath, jobName) {
 
       // (Opcional) Limpiar el job del servidor de Moises
       try {
+        logStage("MOISES", "Eliminando job remoto", jobId);
         await moises.deleteJob(jobId);
         logDebug(`Job ${jobId} eliminado del servidor de Moises.`);
       } catch (deleteError) {
@@ -470,6 +551,7 @@ async function processAudioWithMoises(filePath, jobName) {
     }
   } catch (error) {
     console.error(chalk.red("\nError durante el procesamiento con Moises:"));
+    logStage("MOISES-ERROR", "Excepción capturada", trimForLog(error?.message || error));
     if (debugMode && error) {
       console.error(chalk.red(error.message || error));
     } else {
@@ -495,6 +577,17 @@ async function combineAndPlayAudio(wavFiles, outputDir) {
   const combinedFileName = "combined_drums.wav";
   const combinedOutputPath = path.join(outputDir, combinedFileName);
 
+  logStage(
+    "FFMPEG",
+    "Preparando combinación",
+    trimForLog(
+      JSON.stringify({
+        inputCount: wavFiles.length,
+        output: combinedOutputPath,
+      })
+    )
+  );
+
   // La lista wavFiles ya viene filtrada y verificada en la función llamadora
   if (wavFiles.length === 0) {
     console.error(
@@ -508,6 +601,7 @@ async function combineAndPlayAudio(wavFiles, outputDir) {
         "Solo hay 1 archivo WAV relevante. Reproduciendo directamente..."
       )
     );
+    logStage("FFMPEG", "Solo un stem, se reproduce directamente", wavFiles[0]);
     await playAudioFile(wavFiles[0]);
     return;
   }
@@ -518,10 +612,12 @@ async function combineAndPlayAudio(wavFiles, outputDir) {
   const command = `ffmpeg ${inputArgs} -filter_complex "${filterComplex}" -y "${combinedOutputPath}"`;
 
   console.log(chalk.blue("\nCombinando archivos de batería con ffmpeg..."));
-  logDebug(
-    `Archivos a combinar: ${wavFiles.map((f) => path.basename(f)).join(", ")}`
+  logStage(
+    "FFMPEG",
+    "Archivos a combinar",
+    wavFiles.map((f) => path.basename(f))
   );
-  logDebug(`Comando: ${command}`);
+  logStage("FFMPEG", "Comando ffmpeg", command);
 
   try {
     await new Promise((resolve, reject) => {
@@ -579,6 +675,7 @@ async function combineAndPlayAudio(wavFiles, outputDir) {
     // Si la combinación fue exitosa, reproducir
     await playAudioFile(combinedOutputPath);
   } catch (error) {
+    logStage("FFMPEG-ERROR", "Fallo al combinar stems", trimForLog(error?.message || error));
     console.error(chalk.red(`\nError combinando los archivos de batería:`));
     console.error(chalk.red(`  ${error.message}`));
     // Ya se incluye el mensaje sobre instalar ffmpeg en el propio error
@@ -600,6 +697,7 @@ async function playAudioFile(audioFilePath) {
     return;
   }
 
+  logStage("PLAY", "Reproduciendo archivo", audioFilePath);
   const baseName = path.basename(audioFilePath);
   let duration = null;
   let progressInterval = null; // Guardar la referencia al intervalo
@@ -693,6 +791,11 @@ async function playAudioFile(audioFilePath) {
     process.stdout.write("\r" + " ".repeat(process.stdout.columns - 1) + "\r"); // Limpiar línea en caso de error
     console.error(chalk.red(`\n❌ Error reproduciendo el archivo de audio:`));
     console.error(chalk.red(`  ${playError.message}`));
+    logStage(
+      "PLAY-ERROR",
+      "Detalle",
+      trimForLog(playError?.message || playError)
+    );
     if (!debugMode && playError.message.includes("compatible")) {
       console.error(
         chalk.yellow(
@@ -714,6 +817,7 @@ async function playAudioFile(audioFilePath) {
  * Función principal del CLI.
  */
 async function main() {
+  logStage("MAIN", "Inicio del flujo", { debugMode });
   console.log(
     chalk.bold.cyan("--- Buscador y Extractor de Baterías de YouTube ---")
   );
@@ -731,6 +835,7 @@ async function main() {
 
   // 2. Buscar videos
   const videos = await searchVideos(query.trim());
+  logStage("MAIN", "Resultados obtenidos", videos.length);
 
   if (!videos || videos.length === 0) {
     console.log(chalk.magenta("\nTerminando ejecución."));
@@ -758,18 +863,25 @@ async function main() {
     );
     return;
   }
+  logStage(
+    "MAIN",
+    "Video elegido",
+    trimForLog(`${selectedVideo.title} (${selectedVideoId})`)
+  );
 
   // 5. Descargar el audio del video seleccionado
   const downloadedFilePath = await downloadVideoAudio(
     selectedVideo.videoId,
     selectedVideo.title
   );
+  logStage("MAIN", "Ruta descargada", downloadedFilePath);
 
   // 6. Procesar con Moises si la descarga fue exitosa
   if (downloadedFilePath) {
     const jobName = selectedVideo.title
       .replace(/[\u0000-\u001F\\/?*:|"<>]/g, "_")
       .substring(0, 100);
+    logStage("MAIN", "Preparando job Moises", jobName);
     await processAudioWithMoises(downloadedFilePath, jobName);
   } else {
     console.log(
