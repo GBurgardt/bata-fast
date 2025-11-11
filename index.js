@@ -1,13 +1,17 @@
 #!/usr/bin/env node
 
 import { google } from "googleapis";
-import inquirer from "inquirer";
 import dotenv from "dotenv";
 import { exec } from "child_process"; // Usaremos exec para llamar a yt-dlp directamente para mejor control
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
-import chalk from "chalk"; // Para mejorar la salida en consola
+import chalk from "chalk"; // Para logs y debug
+import logUpdate from "log-update";
+import wrapAnsi from "wrap-ansi";
+import { createSpinner } from "nanospinner";
+import enquirer from "enquirer";
+import { cyan, dim, green, red, yellow } from "colorette";
 import Moises from "moises/sdk.js"; // <--- Importar SDK de Moises
 import player from "play-sound"; // <--- Importar para reproducir audio
 
@@ -18,6 +22,66 @@ const __dirname = path.dirname(__filename);
 const DOWNLOADS_DIR = path.join(__dirname, "downloads");
 const PROCESSED_DIR = path.join(DOWNLOADS_DIR, "processed_stems"); // Carpeta para resultados de Moises
 const audioPlayer = player({}); // Inicializar play-sound una vez
+const { Input, Select, Confirm } = enquirer;
+
+const termWidth = Math.min(process.stdout.columns || 80, 72);
+const wrapLine = (text = "") =>
+  wrapAnsi(text, termWidth, { hard: false, trim: true });
+const voice = {
+  say: (text = "") => console.log(wrapLine(text)),
+  hint: (text = "") => console.log(dim(wrapLine(text))),
+  success: (text = "") => console.log(green(wrapLine(text))),
+  warn: (text = "") => console.log(yellow(wrapLine(text))),
+  error: (text = "") => console.log(red(wrapLine(text))),
+};
+const createStatus = (text) =>
+  createSpinner(wrapLine(text), { color: "cyan" }).start();
+const createCalmProgress = () => {
+  const update = logUpdate.create();
+  return {
+    set: (text = "") => update(wrapLine(text)),
+    clear: () => update.clear(),
+  };
+};
+const tidyTitle = (title = "") => title.replace(/\s+/g, " ").trim();
+const formatVideoChoice = (video, index) => {
+  const durationLabel =
+    typeof video.durationSeconds === "number"
+      ? formatTime(video.durationSeconds)
+      : "??:??";
+  return `${index + 1} • ${tidyTitle(video.title)} · ${durationLabel}`;
+};
+
+async function promptSearchTerm() {
+  voice.say(cyan("bata · drum finder"));
+  voice.hint("type an artist, song, or mood");
+  const inputPrompt = new Input({
+    message: "what do you feel like hearing?",
+    validate: (value) =>
+      value.trim().length > 0 || "say something so i can search.",
+  });
+  const value = await inputPrompt.run();
+  return value.trim();
+}
+
+async function promptVideoSelection(videos) {
+  const selectPrompt = new Select({
+    message: "pick the take that feels right",
+    choices: videos.map((video, index) => ({
+      name: formatVideoChoice(video, index),
+      value: video.videoId,
+    })),
+  });
+  return selectPrompt.run();
+}
+
+async function promptConfirm(message, initial = true) {
+  const confirmPrompt = new Confirm({
+    message,
+    initial,
+  });
+  return confirmPrompt.run();
+}
 
 // --- Detección de Modo Debug ---
 // Comprueba si se pasó el flag --debug
@@ -57,6 +121,9 @@ const trimForLog = (value, maxLength = 600) => {
  * @param {any} [payload]
  */
 const logStage = (label, message, payload) => {
+  if (!debugMode) {
+    return;
+  }
   const prefix = chalk.magenta(`[${label}]`);
   if (payload !== undefined) {
     console.log(prefix, message, payload);
@@ -67,39 +134,19 @@ const logStage = (label, message, payload) => {
 
 // Asegurarse de que los directorios existan
 if (!fs.existsSync(DOWNLOADS_DIR)) {
-  console.log(
-    chalk.yellow(`Creando directorio de descargas en: ${DOWNLOADS_DIR}`)
-  );
-  fs.mkdirSync(DOWNLOADS_DIR);
+  fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
+  logStage("FS", "created downloads dir", DOWNLOADS_DIR);
 }
 // No creamos PROCESSED_DIR aquí, moises.downloadJobResults lo hará si es necesario
 
 // Validar API Keys
 if (!process.env.YOUTUBE_API_KEY) {
-  console.error(
-    chalk.red(
-      "Error: La variable de entorno YOUTUBE_API_KEY no está configurada."
-    )
-  );
-  console.log(
-    chalk.yellow(
-      "Asegúrate de tener un archivo .env con YOUTUBE_API_KEY=TU_CLAVE_YOUTUBE"
-    )
-  );
+  voice.error("missing YOUTUBE_API_KEY in your .env file.");
   process.exit(1);
 }
 // ---> Validar API Key de Moises
 if (!process.env.MOISES_API_KEY) {
-  console.error(
-    chalk.red(
-      "Error: La variable de entorno MOISES_API_KEY no está configurada."
-    )
-  );
-  console.log(
-    chalk.yellow(
-      "Asegúrate de tener un archivo .env con MOISES_API_KEY=TU_CLAVE_MOISES"
-    )
-  );
+  voice.error("missing MOISES_API_KEY in your .env file.");
   process.exit(1);
 }
 
@@ -131,6 +178,16 @@ function formatTime(totalSeconds) {
   )}`;
 }
 
+function isoDurationToSeconds(duration) {
+  if (!duration) return null;
+  const match = duration.match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/);
+  if (!match) return null;
+  const hours = parseInt(match[1] || "0", 10);
+  const minutes = parseInt(match[2] || "0", 10);
+  const seconds = parseInt(match[3] || "0", 10);
+  return hours * 3600 + minutes * 60 + seconds;
+}
+
 /**
  * Obtiene la duración de un archivo de audio usando ffprobe.
  * @param {string} filePath
@@ -148,17 +205,11 @@ async function getAudioDuration(filePath) {
           error.message.includes("ENOENT") ||
           error.message.toLowerCase().includes("not found")
         ) {
-          console.warn(
-            chalk.yellow(
-              "Advertencia: ffprobe no encontrado. No se mostrará la duración del audio. Asegúrate de que ffmpeg esté instalado."
-            )
+          voice.warn(
+            "ffprobe isn't available, so duration will be hidden. install ffmpeg to unlock it."
           );
         } else {
-          console.warn(
-            chalk.yellow(
-              "Advertencia: No se pudo obtener la duración del audio."
-            )
-          );
+          voice.warn("couldn't read the audio duration.");
         }
         resolve(null); // No fallar, solo devolver null
         return;
@@ -166,11 +217,7 @@ async function getAudioDuration(filePath) {
       const duration = parseFloat(stdout.trim());
       if (isNaN(duration)) {
         logDebug("ffprobe devolvió una duración no válida:", stdout);
-        console.warn(
-          chalk.yellow(
-            "Advertencia: No se pudo parsear la duración del audio devuelta por ffprobe."
-          )
-        );
+        voice.warn("ffprobe returned an unexpected duration format.");
         resolve(null);
       } else {
         logDebug("Duración obtenida (segundos):", duration);
@@ -202,15 +249,32 @@ async function searchVideos(query, maxResults = 5) {
         title: item.snippet?.title,
       })) || [];
 
-    if (items.length === 0) {
-      console.log(chalk.yellow("No se encontraron videos para esa búsqueda."));
+    const validItems = items.filter((item) => item.videoId && item.title);
+
+    if (validItems.length === 0) {
       return [];
     }
 
-    // Filtrar resultados inválidos (sin videoId o title)
-    return items.filter((item) => item.videoId && item.title);
+    const ids = validItems.map((item) => item.videoId).join(",");
+    const durationsMap = new Map();
+    if (ids.length > 0) {
+      const durationResponse = await youtube.videos.list({
+        part: ["contentDetails"],
+        id: ids,
+      });
+      durationResponse.data.items?.forEach((video) => {
+        const seconds = isoDurationToSeconds(
+          video.contentDetails?.duration || ""
+        );
+        durationsMap.set(video.id, seconds);
+      });
+    }
+
+    return validItems.map((item) => ({
+      ...item,
+      durationSeconds: durationsMap.get(item.videoId) ?? null,
+    }));
   } catch (error) {
-    console.error(chalk.red("\nError buscando videos en YouTube:"));
     logStage(
       "YOUTUBE-ERROR",
       "Detalles",
@@ -218,27 +282,11 @@ async function searchVideos(query, maxResults = 5) {
         error.response?.data?.error?.message || error.message || "sin mensaje"
       )
     );
-    if (debugMode) {
-      if (error.response?.data?.error?.message) {
-        console.error(
-          chalk.red(`  Detalles: ${error.response.data.error.message}`)
-        );
-        if (error.response.data.error.message.includes("quotaExceeded")) {
-          console.warn(
-            chalk.yellow(
-              "  Parece que has excedido la cuota de la API de YouTube."
-            )
-          );
-        }
-      } else {
-        console.error(chalk.red(`  Detalles: ${error.message}`));
-      }
-    } else {
-      console.error(
-        chalk.yellow("  Ejecuta con --debug para ver más detalles.")
-      );
-    }
-    return []; // Devuelve vacío en caso de error para no detener el flujo principal
+    throw new Error(
+      error.response?.data?.error?.message ||
+        error.message ||
+        "youtube search failed"
+    );
   }
 }
 
@@ -248,7 +296,8 @@ async function searchVideos(query, maxResults = 5) {
  * @param {string} title Título del video para el nombre de archivo.
  * @returns {Promise<string | null>} Ruta al archivo descargado o null si falla.
  */
-async function downloadVideoAudio(videoId, title) {
+async function downloadVideoAudio(videoId, title, callbacks = {}) {
+  const { onMessage, onProgress } = callbacks;
   const videoUrl = `https://www.youtube.com/watch?v=${videoId}`;
   // Nombre de archivo seguro: reemplazar caracteres inválidos
   const safeTitle = title
@@ -270,41 +319,31 @@ async function downloadVideoAudio(videoId, title) {
   const stdoutChunks = [];
   const stderrChunks = [];
 
-  return new Promise((resolve) => {
-    // Cambiado para resolver con outputPath o null
+  return new Promise((resolve, reject) => {
     const downloadProcess = exec(command);
 
-    // Mostrar progreso de yt-dlp (es bastante útil)
+    onMessage?.("pulling audio…");
+
     downloadProcess.stdout?.on("data", (data) => {
-      stdoutChunks.push(data.toString());
-      // Filtrar algunos mensajes menos útiles si no estamos en debug
-      if (
-        debugMode ||
-        (!data.includes("Destination:") &&
-          !data.includes("Deleting original file"))
-      ) {
-        process.stdout.write(chalk.gray(data));
+      const chunk = data.toString();
+      stdoutChunks.push(chunk);
+      if (debugMode) {
+        process.stdout.write(chalk.gray(chunk));
+        return;
+      }
+
+      const percentMatch = chunk.match(/(\d+(?:\.\d+)?)%/);
+      if (percentMatch) {
+        onProgress?.(parseFloat(percentMatch[1]));
       }
     });
 
-    // Mostrar errores detallados solo en modo debug
     downloadProcess.stderr?.on("data", (data) => {
       const stderrText = data.toString();
       stderrChunks.push(stderrText);
       if (debugMode) {
-        // En modo debug, mostrar todo stderr (incluso mensajes informativos)
         process.stderr.write(chalk.redBright(stderrText));
         logStage("DOWNLOAD-STDERR", trimForLog(stderrText));
-      } else {
-        // En modo normal, intentar mostrar solo errores reales de stderr, no progreso
-        if (
-          !data.includes("Deleting original file") &&
-          !data.includes("[ExtractAudio]") &&
-          !data.includes("[download]") // Filtrar líneas de progreso que a veces van a stderr
-        ) {
-          process.stderr.write(chalk.red(stderrText));
-          logStage("DOWNLOAD-STDERR", trimForLog(stderrText));
-        }
       }
     });
 
@@ -321,38 +360,24 @@ async function downloadVideoAudio(videoId, title) {
         trimForLog(stderrChunks.join("").trim())
       );
       if (code === 0) {
-        console.log(
-          chalk.green(
-            `\n¡Descarga completada! Archivo guardado en ${outputPath}`
+        logStage("DOWNLOAD", "Archivo final", outputPath);
+        resolve(outputPath);
+      } else {
+        reject(
+          new Error(
+            `yt-dlp exited with code ${code}. run with --debug for details.`
           )
         );
-        logStage("DOWNLOAD", "Archivo final", outputPath);
-        resolve(outputPath); // <--- Resuelve con la ruta del archivo
-      } else {
-        console.error(
-          chalk.red(`\nError durante la descarga (código de salida: ${code}).`)
-        );
-        if (!debugMode) {
-          console.error(
-            chalk.yellow("  Asegúrate de tener yt-dlp instalado y accesible.")
-          );
-          console.error(
-            chalk.yellow("  Ejecuta con --debug para ver detalles del error.")
-          );
-        }
-        resolve(null); // <--- Resuelve con null si falla
       }
     });
 
     downloadProcess.on("error", (err) => {
-      console.error(chalk.red("\nError al ejecutar el comando de descarga:"));
-      if (debugMode) {
-        console.error(chalk.red(err));
-      }
-      console.error(
-        chalk.red("Asegúrate de tener yt-dlp instalado y accesible en tu PATH.")
+      logStage("DOWNLOAD", "Error lanzando yt-dlp", err.message);
+      reject(
+        new Error(
+          "couldn't start yt-dlp. is it installed and on your path?"
+        )
       );
-      resolve(null); // <--- Resuelve con null si falla
     });
   });
 }
@@ -365,215 +390,127 @@ async function downloadVideoAudio(videoId, title) {
  * @param {string} jobName Nombre para identificar el job en Moises.
  * @returns {Promise<void>}
  */
-async function processAudioWithMoises(filePath, jobName) {
-  logStage("MOISES", "--- Iniciando procesamiento con Music AI (Moises) ---");
-  console.log(
-    chalk.cyan("\n--- Iniciando procesamiento con Music AI (Moises) ---")
-  );
+async function processAudioWithMoises(filePath, jobName, callbacks = {}) {
+  const { onPhase } = callbacks;
+  const safeJobName = jobName
+    .replace(/[\u0000-\u001F\\/?*:|"<>]/g, "_")
+    .substring(0, 120);
 
   try {
-    // 1. Subir archivo a Moises
+    onPhase?.("sending to the studio…");
     logStage("MOISES", "Subiendo archivo", filePath);
-    console.log(chalk.blue(`Subiendo archivo: ${path.basename(filePath)}...`));
     const downloadUrl = await moises.uploadFile(filePath);
-    console.log(chalk.green("Archivo subido con éxito."));
     logDebug(`URL temporal: ${downloadUrl}`);
 
-    // 2. Crear el Job
-    logStage("MOISES", "Creando job", jobName);
-    console.log(chalk.blue(`Creando job en Moises para extraer batería...`));
-    logDebug(`Workflow: ${MOISES_WORKFLOW_DRUMS}`);
-    const jobId = await moises.addJob(jobName, MOISES_WORKFLOW_DRUMS, {
+    onPhase?.("setting up the session…");
+    logStage("MOISES", "Creando job", safeJobName);
+    const jobId = await moises.addJob(safeJobName, MOISES_WORKFLOW_DRUMS, {
       inputUrl: downloadUrl,
     });
     logStage("MOISES", "Job creado", jobId);
-    console.log(chalk.green(`Job creado con ID: ${jobId}`));
 
-    // 3. Esperar a que el Job se complete
-    logStage("MOISES", "Esperando finalización del job");
-    console.log(chalk.blue("Procesando audio con IA (esto puede tardar)..."));
+    onPhase?.("ai is isolating drums…");
     const job = await moises.waitForJobCompletion(jobId);
     logStage("MOISES", "Job completado", job.status);
 
-    // 4. Revisar resultado y descargar
-    if (job.status === "SUCCEEDED") {
-      console.log(chalk.green("¡Procesamiento IA completado con éxito!"));
-      console.log(chalk.blue("Descargando resultados..."));
+    if (job.status !== "SUCCEEDED") {
+      throw new Error(
+        `moises job ended with status ${job.status.toLowerCase()}`
+      );
+    }
 
-      // Crear un directorio específico para los resultados de este job
-      const jobOutputDir = path.join(
-        PROCESSED_DIR,
-        jobName.replace(/[\u0000-\u001F\\/?*:|"<>]/g, "_")
-      ); // Nombre de carpeta seguro
-      if (!fs.existsSync(jobOutputDir)) {
-        fs.mkdirSync(jobOutputDir, { recursive: true });
+    onPhase?.("downloading stems…");
+    const jobOutputDir = path.join(PROCESSED_DIR, safeJobName);
+    if (!fs.existsSync(jobOutputDir)) {
+      fs.mkdirSync(jobOutputDir, { recursive: true });
+    }
+    await moises.downloadJobResults(job, jobOutputDir);
+    logStage("MOISES", "Resultados descargados en", jobOutputDir);
+
+    const drumWavFiles = collectDrumStems(jobOutputDir);
+    logStage("MOISES", "Stems de batería seleccionados", drumWavFiles);
+
+    return { jobId, jobOutputDir, drumWavFiles };
+  } catch (error) {
+    logStage(
+      "MOISES-ERROR",
+      "Detalle",
+      trimForLog(error?.message || error)
+    );
+    throw new Error(
+      error?.message || "moises could not finish processing that take."
+    );
+  }
+}
+
+function collectDrumStems(jobOutputDir) {
+  const resultJsonPath = path.join(jobOutputDir, "workflow.result.json");
+  let potentialDrumFiles = [];
+
+  if (fs.existsSync(resultJsonPath)) {
+    try {
+      const resultJson = JSON.parse(fs.readFileSync(resultJsonPath, "utf-8"));
+      potentialDrumFiles = Object.values(resultJson)
+        .filter(
+          (val) => typeof val === "string" && val.toLowerCase().endsWith(".wav")
+        )
+        .map((relativePath) =>
+          path.join(jobOutputDir, path.basename(relativePath))
+        );
+      logDebug(
+        "[DEBUG] Archivos WAV encontrados en JSON (antes de filtrar):",
+        potentialDrumFiles
+      );
+    } catch (jsonError) {
+      logStage("MOISES", "failed parsing workflow.result.json", jsonError.message);
+    }
+  } else {
+    logStage(
+      "MOISES",
+      "workflow.result.json no encontrado, escaneando carpeta",
+      jobOutputDir
+    );
+  }
+
+  if (potentialDrumFiles.length === 0) {
+    try {
+      potentialDrumFiles = fs
+        .readdirSync(jobOutputDir)
+        .filter(
+          (file) =>
+            file.toLowerCase().endsWith(".wav") &&
+            file !== "combined_drums.wav"
+        )
+        .map((file) => path.join(jobOutputDir, file));
+      if (potentialDrumFiles.length > 0) {
+        logDebug(
+          "[DEBUG] Archivos WAV encontrados por escaneo (antes de filtrar):",
+          potentialDrumFiles
+        );
       }
-
-      await moises.downloadJobResults(job, jobOutputDir);
-      logStage("MOISES", "Resultados descargados en", jobOutputDir);
-      console.log(chalk.green(`Resultados descargados en: ${jobOutputDir}`));
-
+    } catch (readDirError) {
       logStage(
         "MOISES",
-        "Resumen job",
-        trimForLog(
-          JSON.stringify({
-            jobId,
-            status: job.status,
-            outputDir: jobOutputDir,
-          })
-        )
-      );
-
-      const resultJsonPath = path.join(jobOutputDir, "workflow.result.json");
-      let potentialDrumFiles = [];
-      if (fs.existsSync(resultJsonPath)) {
-        try {
-          const resultJson = JSON.parse(
-            fs.readFileSync(resultJsonPath, "utf-8")
-          );
-          // Asumir que todos los valores terminados en .wav son stems de batería relevantes
-          potentialDrumFiles = Object.values(resultJson)
-            .filter(
-              (val) =>
-                typeof val === "string" && val.toLowerCase().endsWith(".wav")
-            )
-            .map((relativePath) =>
-              path.join(jobOutputDir, path.basename(relativePath))
-            ); // Usar basename para asegurar que sea el archivo correcto en jobOutputDir
-          logDebug(
-            "[DEBUG] Archivos WAV encontrados en JSON (antes de filtrar):",
-            potentialDrumFiles
-          );
-        } catch (jsonError) {
-          console.warn(
-            chalk.yellow(
-              `Advertencia: No se pudo leer ${resultJsonPath}: ${jsonError.message}`
-            )
-          );
-        }
-      } else {
-        logDebug(
-          `No se encontró ${resultJsonPath}. Intentando escanear directorio.`
-        );
-      }
-
-      if (potentialDrumFiles.length === 0) {
-        try {
-          potentialDrumFiles = fs
-            .readdirSync(jobOutputDir)
-            .filter(
-              (file) =>
-                file.toLowerCase().endsWith(".wav") &&
-                file !== "combined_drums.wav"
-            ) // Excluir el combinado si ya existe
-            .map((file) => path.join(jobOutputDir, file));
-          if (potentialDrumFiles.length > 0) {
-            logDebug(
-              "[DEBUG] Archivos WAV encontrados por escaneo (antes de filtrar):",
-              potentialDrumFiles
-            );
-          } else {
-            logDebug("No se encontraron archivos .wav en el directorio.");
-          }
-        } catch (readDirError) {
-          console.warn(
-            chalk.yellow(
-              `Advertencia: Error leyendo el directorio ${jobOutputDir}: ${readDirError.message}`
-            )
-          );
-        }
-      }
-
-      const drumWavFiles = potentialDrumFiles.filter((file) => {
-        const fileNameLower = path.basename(file).toLowerCase();
-        return (
-          fileNameLower !== "other.wav" &&
-          fileNameLower !== "combined_drums.wav"
-        );
-      });
-
-      logDebug("[DEBUG] Archivos WAV de batería filtrados:", drumWavFiles);
-      logStage("MOISES", "Stems de batería seleccionados", drumWavFiles);
-
-      // Preguntar al usuario si quiere escuchar
-      if (drumWavFiles.length > 1) {
-        const { shouldPlay } = await inquirer.prompt([
-          {
-            type: "confirm",
-            name: "shouldPlay",
-            message: `Se encontraron ${drumWavFiles.length} stems de batería relevantes. ¿Quieres combinarlos y escucharlos? (Necesitas ffmpeg)`,
-            default: false,
-          },
-        ]);
-        if (shouldPlay) {
-          await combineAndPlayAudio(drumWavFiles, jobOutputDir);
-        }
-      } else if (drumWavFiles.length === 1) {
-        const { shouldPlaySingle } = await inquirer.prompt([
-          {
-            type: "confirm",
-            name: "shouldPlaySingle",
-            message: `Se encontró 1 stem de batería (${path.basename(
-              drumWavFiles[0]
-            )}). ¿Quieres escucharlo?`,
-            default: false,
-          },
-        ]);
-        if (shouldPlaySingle) {
-          await playAudioFile(drumWavFiles[0]);
-        }
-      } else {
-        console.log(
-          chalk.yellow(
-            "No se encontraron archivos de batería (.wav) relevantes para reproducir."
-          )
-        );
-      }
-
-      // (Opcional) Limpiar el job del servidor de Moises
-      try {
-        logStage("MOISES", "Eliminando job remoto", jobId);
-        await moises.deleteJob(jobId);
-        logDebug(`Job ${jobId} eliminado del servidor de Moises.`);
-      } catch (deleteError) {
-        console.warn(
-          chalk.yellow(
-            `Advertencia: No se pudo eliminar el job ${jobId} de Moises: ${deleteError.message}`
-          )
-        );
-      }
-    } else {
-      console.error(
-        chalk.red(`El procesamiento de Moises falló con estado: ${job.status}`)
-      );
-      // Podríamos intentar obtener más detalles del error si la API los proporciona
-    }
-  } catch (error) {
-    console.error(chalk.red("\nError durante el procesamiento con Moises:"));
-    logStage("MOISES-ERROR", "Excepción capturada", trimForLog(error?.message || error));
-    if (debugMode && error) {
-      console.error(chalk.red(error.message || error));
-    } else {
-      console.error(
-        chalk.yellow(
-          "  Verifica tu API Key de Moises, conexión a internet o ejecuta con --debug para detalles."
-        )
+        "Error leyendo el directorio de resultados",
+        readDirError.message
       );
     }
-    logDebug(`Workflow utilizado: ${MOISES_WORKFLOW_DRUMS}`);
-    // No relanzamos el error para que el script principal pueda continuar si es posible
   }
-  console.log(chalk.cyan("--- Fin del procesamiento con Music AI ---"));
+
+  return potentialDrumFiles.filter((file) => {
+    const fileNameLower = path.basename(file).toLowerCase();
+    return fileNameLower !== "other.wav" && fileNameLower !== "combined_drums.wav";
+  });
 }
+
 
 // --- Nueva Función ---
 /**
- * Combina archivos WAV usando ffmpeg y los reproduce.
+ * Combines WAV stems with ffmpeg and returns the resulting path.
  * @param {string[]} wavFiles - Lista de rutas absolutas a los archivos WAV a combinar (ya filtrados).
  * @param {string} outputDir - Directorio donde guardar el archivo combinado.
  */
-async function combineAndPlayAudio(wavFiles, outputDir) {
+async function combineDrumStems(wavFiles, outputDir) {
   const combinedFileName = "combined_drums.wav";
   const combinedOutputPath = path.join(outputDir, combinedFileName);
 
@@ -588,22 +525,12 @@ async function combineAndPlayAudio(wavFiles, outputDir) {
     )
   );
 
-  // La lista wavFiles ya viene filtrada y verificada en la función llamadora
   if (wavFiles.length === 0) {
-    console.error(
-      chalk.red("Error: No hay archivos WAV válidos para combinar.")
-    );
-    return;
+    throw new Error("no drum stems available to combine.");
   }
   if (wavFiles.length === 1) {
-    console.warn(
-      chalk.yellow(
-        "Solo hay 1 archivo WAV relevante. Reproduciendo directamente..."
-      )
-    );
-    logStage("FFMPEG", "Solo un stem, se reproduce directamente", wavFiles[0]);
-    await playAudioFile(wavFiles[0]);
-    return;
+    logStage("FFMPEG", "Solo un stem, devolver directamente", wavFiles[0]);
+    return wavFiles[0];
   }
 
   const inputArgs = wavFiles.map((file) => `-i "${file}"`).join(" ");
@@ -611,7 +538,6 @@ async function combineAndPlayAudio(wavFiles, outputDir) {
   // Usamos -y para sobrescribir el archivo combinado si ya existe
   const command = `ffmpeg ${inputArgs} -filter_complex "${filterComplex}" -y "${combinedOutputPath}"`;
 
-  console.log(chalk.blue("\nCombinando archivos de batería con ffmpeg..."));
   logStage(
     "FFMPEG",
     "Archivos a combinar",
@@ -632,14 +558,12 @@ async function combineAndPlayAudio(wavFiles, outputDir) {
             error.message.toLowerCase().includes("not found")
           ) {
             return reject(
-              new Error(
-                `Comando ffmpeg no encontrado. Asegúrate de que ffmpeg esté instalado y en tu PATH.`
-              )
+              new Error("ffmpeg is missing. install it and try again.")
             );
           }
           return reject(
             new Error(
-              `ffmpeg falló (código ${error.code}). Ejecuta con --debug para ver salida de ffmpeg.`
+              `ffmpeg exited with code ${error.code}. run with --debug for the raw output.`
             )
           );
         }
@@ -651,16 +575,12 @@ async function combineAndPlayAudio(wavFiles, outputDir) {
           err.message.includes("ENOENT") ||
           err.message.toLowerCase().includes("not found")
         ) {
-          reject(
-            new Error(
-              `Comando ffmpeg no encontrado. Asegúrate de que ffmpeg esté instalado y en tu PATH.`
-            )
-          );
+          reject(new Error("ffmpeg is missing. install it and try again."));
         } else {
           reject(
             new Error(
-              `Error ejecutando ffmpeg: ${
-                debugMode ? err.message : "Ejecuta con --debug para detalles."
+              `ffmpeg couldn't run: ${
+                debugMode ? err.message : "run with --debug for details."
               }`
             )
           );
@@ -668,17 +588,14 @@ async function combineAndPlayAudio(wavFiles, outputDir) {
       });
     });
 
-    console.log(
-      chalk.green(`\n¡Archivos combinados con éxito en ${combinedOutputPath}!`)
-    );
-
-    // Si la combinación fue exitosa, reproducir
-    await playAudioFile(combinedOutputPath);
+    return combinedOutputPath;
   } catch (error) {
-    logStage("FFMPEG-ERROR", "Fallo al combinar stems", trimForLog(error?.message || error));
-    console.error(chalk.red(`\nError combinando los archivos de batería:`));
-    console.error(chalk.red(`  ${error.message}`));
-    // Ya se incluye el mensaje sobre instalar ffmpeg en el propio error
+    logStage(
+      "FFMPEG-ERROR",
+      "Fallo al combinar stems",
+      trimForLog(error?.message || error)
+    );
+    throw error;
   }
 }
 
@@ -689,11 +606,7 @@ async function combineAndPlayAudio(wavFiles, outputDir) {
  */
 async function playAudioFile(audioFilePath) {
   if (!fs.existsSync(audioFilePath)) {
-    console.error(
-      chalk.red(
-        `Error: El archivo de audio a reproducir no existe: ${audioFilePath}`
-      )
-    );
+    voice.error("can't find that file to play.");
     return;
   }
 
@@ -709,8 +622,8 @@ async function playAudioFile(audioFilePath) {
 
     // Mensaje inicial (será sobrescrito si hay progreso)
     process.stdout.write(
-      chalk.blue(
-        `\n▶️ Reproduciendo: ${baseName} [00:00 / ${durationStr}] (Ctrl+C para detener)`
+      wrapLine(
+        `\nlistening to ${baseName} [00:00 / ${durationStr}] · ctrl+c to stop`
       )
     );
 
@@ -727,8 +640,8 @@ async function playAudioFile(audioFilePath) {
           const currentTimeStr = formatTime(currentSeconds);
           // Usar \r para volver al inicio de la línea y sobrescribir
           process.stdout.write(
-            chalk.blue(
-              `\r▶️ Reproduciendo: ${baseName} [${currentTimeStr} / ${durationStr}] (Ctrl+C para detener) `
+            wrapLine(
+              `\rlistening to ${baseName} [${currentTimeStr} / ${durationStr}] · ctrl+c to stop `
             )
           ); // Espacio extra al final
         }, 1000); // Actualizar cada segundo
@@ -737,9 +650,7 @@ async function playAudioFile(audioFilePath) {
       const audioProcess = audioPlayer.play(audioFilePath, (err) => {
         clearInterval(progressInterval); // Detener intervalo al terminar/error
         // Limpiar la línea de progreso antes de mostrar el mensaje final o error
-        process.stdout.write(
-          "\r" + " ".repeat(process.stdout.columns - 1) + "\r"
-        );
+        process.stdout.write("\r" + " ".repeat(termWidth) + "\r");
 
         if (err) {
           let errorMsg = err.message;
@@ -750,11 +661,11 @@ async function playAudioFile(audioFilePath) {
               err.code === "ENOENT")
           ) {
             errorMsg =
-              "No se encontró un reproductor de audio compatible (afplay, mplayer, etc.)";
+              "no compatible audio player found (afplay, mplayer, ...).";
           }
           reject(new Error(errorMsg));
         } else {
-          console.log(chalk.green(`⏹️ Reproducción finalizada: ${baseName}`));
+          voice.success(`done listening to ${baseName}.`);
           resolve();
         }
       });
@@ -767,9 +678,7 @@ async function playAudioFile(audioFilePath) {
         });
         audioProcess.on("error", (error) => {
           clearInterval(progressInterval); // Detener intervalo en error del proceso
-          process.stdout.write(
-            "\r" + " ".repeat(process.stdout.columns - 1) + "\r"
-          ); // Limpiar línea
+          process.stdout.write("\r" + " ".repeat(termWidth) + "\r"); // Limpiar línea
           logDebug(`Error en proceso de audio: ${error}`);
           reject(
             new Error(`Error en el reproductor de audio: ${error.message}`)
@@ -777,38 +686,25 @@ async function playAudioFile(audioFilePath) {
         });
       } else {
         clearInterval(progressInterval); // Detener si no hay proceso
-        process.stdout.write(
-          "\r" + " ".repeat(process.stdout.columns - 1) + "\r"
-        ); // Limpiar línea
+        process.stdout.write("\r" + " ".repeat(termWidth) + "\r"); // Limpiar línea
         logDebug("play-sound no devolvió un proceso hijo.");
-        reject(new Error("No se pudo iniciar el proceso de reproducción."));
+        reject(new Error("couldn't start the playback process."));
       }
     });
 
     await playPromise;
   } catch (playError) {
     if (progressInterval) clearInterval(progressInterval); // Asegurarse de limpiar el intervalo en cualquier error
-    process.stdout.write("\r" + " ".repeat(process.stdout.columns - 1) + "\r"); // Limpiar línea en caso de error
-    console.error(chalk.red(`\n❌ Error reproduciendo el archivo de audio:`));
-    console.error(chalk.red(`  ${playError.message}`));
+    process.stdout.write("\r" + " ".repeat(termWidth) + "\r"); // Limpiar línea en caso de error
     logStage(
       "PLAY-ERROR",
       "Detalle",
       trimForLog(playError?.message || playError)
     );
-    if (!debugMode && playError.message.includes("compatible")) {
-      console.error(
-        chalk.yellow(
-          "  Asegúrate de tener un reproductor como 'afplay' (macOS) o 'mplayer'/'aplay' (Linux) instalado."
-        )
-      );
-    }
-    if (!debugMode && playError.message.includes("ffprobe")) {
-      console.error(
-        chalk.yellow(
-          "  Asegúrate de tener 'ffmpeg' (que incluye ffprobe) instalado y en tu PATH para ver la duración."
-        )
-      );
+    if (!debugMode) {
+      voice.warn(playError.message);
+    } else {
+      console.error(playError);
     }
   }
 }
@@ -818,49 +714,35 @@ async function playAudioFile(audioFilePath) {
  */
 async function main() {
   logStage("MAIN", "Inicio del flujo", { debugMode });
-  console.log(
-    chalk.bold.cyan("--- Buscador y Extractor de Baterías de YouTube ---")
-  );
 
-  // 1. Obtener término de búsqueda
-  const { query } = await inquirer.prompt([
-    {
-      type: "input",
-      name: "query",
-      message: "Ingresa tu búsqueda en YouTube:",
-      validate: (input) =>
-        input.trim() !== "" || "Por favor, ingresa algo para buscar.",
-    },
-  ]);
+  const query = await promptSearchTerm();
 
-  // 2. Buscar videos
-  const videos = await searchVideos(query.trim());
-  logStage("MAIN", "Resultados obtenidos", videos.length);
-
-  if (!videos || videos.length === 0) {
-    console.log(chalk.magenta("\nTerminando ejecución."));
+  const searchSpinner = createStatus("looking for it…");
+  let videos = [];
+  try {
+    videos = await searchVideos(query);
+    logStage("MAIN", "Resultados obtenidos", videos.length);
+    if (videos.length === 0) {
+      searchSpinner.error({
+        text: wrapLine("couldn't find anything. try another idea."),
+      });
+      return;
+    }
+    searchSpinner.success({
+      text: wrapLine(`found ${videos.length} takes.`),
+    });
+  } catch (error) {
+    searchSpinner.error({
+      text: wrapLine("youtube isn't answering right now."),
+    });
+    voice.error(error.message);
     return;
   }
 
-  // 3. Mostrar resultados y permitir selección
-  const { selectedVideoId } = await inquirer.prompt([
-    {
-      type: "list",
-      name: "selectedVideoId",
-      message: "Selecciona un video:",
-      choices: videos.map((video, index) => ({
-        name: `${index + 1}. ${video.title}`,
-        value: video.videoId,
-      })),
-    },
-  ]);
-
-  // 4. Obtener el título del video seleccionado
+  const selectedVideoId = await promptVideoSelection(videos);
   const selectedVideo = videos.find((v) => v.videoId === selectedVideoId);
   if (!selectedVideo) {
-    console.error(
-      chalk.red("Error: No se pudo encontrar el video seleccionado.")
-    );
+    voice.error("couldn't find that take anymore.");
     return;
   }
   logStage(
@@ -869,37 +751,99 @@ async function main() {
     trimForLog(`${selectedVideo.title} (${selectedVideoId})`)
   );
 
-  // 5. Descargar el audio del video seleccionado
-  const downloadedFilePath = await downloadVideoAudio(
-    selectedVideo.videoId,
-    selectedVideo.title
-  );
+  voice.say(`pulling “${tidyTitle(selectedVideo.title)}”…`);
+
+  const downloadProgress = createCalmProgress();
+  let downloadedFilePath;
+  try {
+    downloadedFilePath = await downloadVideoAudio(
+      selectedVideo.videoId,
+      selectedVideo.title,
+      {
+        onMessage: (text) => downloadProgress.set(text),
+        onProgress: (percent) =>
+          downloadProgress.set(`pulling audio… ${percent.toFixed(1)}%`),
+      }
+    );
+    downloadProgress.clear();
+    voice.success("audio is ready.");
+  } catch (error) {
+    downloadProgress.clear();
+    voice.error(error.message);
+    return;
+  }
   logStage("MAIN", "Ruta descargada", downloadedFilePath);
 
-  // 6. Procesar con Moises si la descarga fue exitosa
-  if (downloadedFilePath) {
-    const jobName = selectedVideo.title
-      .replace(/[\u0000-\u001F\\/?*:|"<>]/g, "_")
-      .substring(0, 100);
-    logStage("MAIN", "Preparando job Moises", jobName);
-    await processAudioWithMoises(downloadedFilePath, jobName);
-  } else {
-    console.log(
-      chalk.magenta("\nDescarga fallida, no se puede procesar con IA.")
+  const studioSpinner = createStatus("sending to the studio…");
+  let studioResult;
+  try {
+    studioResult = await processAudioWithMoises(
+      downloadedFilePath,
+      selectedVideo.title,
+      {
+        onPhase: (text) =>
+          studioSpinner.update({
+            text: wrapLine(text),
+          }),
+      }
     );
+    studioSpinner.success({
+      text: wrapLine("stems are ready."),
+    });
+  } catch (error) {
+    studioSpinner.error({
+      text: wrapLine("the studio couldn't finish that take."),
+    });
+    voice.error(error.message);
+    return;
   }
 
-  console.log(chalk.magenta("\n¡Proceso finalizado!"));
+  const { drumWavFiles, jobOutputDir } = studioResult;
+  if (!drumWavFiles.length) {
+    voice.warn("couldn't isolate clean drums from that take.");
+    return;
+  }
+
+  const takeLabel = drumWavFiles.length === 1 ? "take" : "takes";
+  voice.say(`${drumWavFiles.length} drum ${takeLabel} ready.`);
+
+  let playbackPath = drumWavFiles[0];
+
+  if (drumWavFiles.length > 1) {
+    const shouldBlend = await promptConfirm("blend them into one take?", true);
+    if (shouldBlend) {
+      const blendSpinner = createStatus("blending the drums…");
+      try {
+        playbackPath = await combineDrumStems(drumWavFiles, jobOutputDir);
+        blendSpinner.success({
+          text: wrapLine("one clean drum take ready."),
+        });
+      } catch (error) {
+        blendSpinner.error({
+          text: wrapLine("couldn't blend them."),
+        });
+        voice.warn(error.message);
+      }
+    }
+  }
+
+  const listenNow = await promptConfirm("listen now?", true);
+  if (listenNow) {
+    await playAudioFile(playbackPath);
+  }
+
+  const displayPath = path.relative(__dirname, playbackPath);
+  voice.success(`ready. saved to ${displayPath}.`);
+  voice.hint("stems live inside downloads/processed_stems if you need them later.");
 }
 
 // Ejecutar la función principal
 main().catch((err) => {
-  console.error(chalk.red("\nError inesperado en la ejecución principal:"));
-  console.error(chalk.red(debugMode ? err : err.message)); // Mostrar stack trace solo en debug
-  if (!debugMode) {
-    console.error(
-      chalk.yellow("Ejecuta con --debug para ver el stack trace completo.")
-    );
+  if (debugMode) {
+    console.error(err);
+  } else {
+    voice.error(err.message || "something went wrong.");
+    voice.hint("run again with --debug for the full trace.");
   }
   process.exit(1);
 });
