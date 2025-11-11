@@ -37,10 +37,11 @@ const voice = {
 const createStatus = (text) =>
   createSpinner(wrapLine(text), { color: "cyan" }).start();
 const createCalmProgress = () => {
-  const update = logUpdate.create();
   return {
-    set: (text = "") => update(wrapLine(text)),
-    clear: () => update.clear(),
+    set: (text = "") => logUpdate(wrapLine(text)),
+    clear: () => {
+      logUpdate.clear();
+    },
   };
 };
 const tidyTitle = (title = "") => title.replace(/\s+/g, " ").trim();
@@ -69,8 +70,12 @@ async function promptVideoSelection(videos) {
     message: "pick the take that feels right",
     choices: videos.map((video, index) => ({
       name: formatVideoChoice(video, index),
-      value: video.videoId,
+      value: video,
     })),
+    result(value) {
+      const choice = this.find(value);
+      return choice?.value ?? value;
+    },
   });
   return selectPrompt.run();
 }
@@ -739,8 +744,7 @@ async function main() {
     return;
   }
 
-  const selectedVideoId = await promptVideoSelection(videos);
-  const selectedVideo = videos.find((v) => v.videoId === selectedVideoId);
+  const selectedVideo = await promptVideoSelection(videos);
   if (!selectedVideo) {
     voice.error("couldn't find that take anymore.");
     return;
@@ -748,7 +752,7 @@ async function main() {
   logStage(
     "MAIN",
     "Video elegido",
-    trimForLog(`${selectedVideo.title} (${selectedVideoId})`)
+    trimForLog(`${selectedVideo.title} (${selectedVideo.videoId})`)
   );
 
   voice.say(`pulling “${tidyTitle(selectedVideo.title)}”…`);
