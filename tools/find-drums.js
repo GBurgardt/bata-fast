@@ -399,10 +399,8 @@ export const findDrumsFlow = async () => {
     }
   }
 
-  const listenNow = await promptConfirm("listen now?", true);
-  if (listenNow) {
-    await playAudioFile(playbackPath);
-  }
+  voice.hint("playing it now… ctrl+c to stop anytime.");
+  await playAudioFile(playbackPath);
 
   const displayPath = path.relative(ROOT_DIR, playbackPath);
   voice.success(`ready. saved to ${displayPath}.`);
