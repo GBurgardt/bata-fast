@@ -67,7 +67,7 @@ const formatRememberChoice = (take) => {
   const lastPlayedLabel = take.lastPlayedAt
     ? `last jam ${formatRelativeTime(take.lastPlayedAt)}`
     : `added ${formatRelativeTime(take.updatedAt)}`;
-  return `🥁 ${take.title}\n   ↳ ${lastPlayedLabel}`;
+  return `${take.title}\n   ${lastPlayedLabel}`;
 };
 
 const promptNotes = async () => {

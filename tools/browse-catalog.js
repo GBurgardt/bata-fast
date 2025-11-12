@@ -58,17 +58,14 @@ const formatTakeChoice = (take) => {
     ? formatTime(take.durationSeconds)
     : "??:??";
   const age = formatRelativeTime(take.updatedAt);
-  const stemsLabel =
-    take.drumFiles.length === 1
-      ? "1 stem"
-      : `${take.drumFiles.length} stems`;
-  let line = `🥁 ${take.title} · ${durationLabel} · ${stemsLabel} · ${age}`;
+  const summary = `${take.title} · ${durationLabel} · ${age}`;
+  let details = "";
   if (take.notes?.length) {
-    line += `\n   💡 ${take.notes.join(" · ")}`;
+    details = `matches: ${take.notes.join(" · ")}`;
   } else if (take.lastPlayedAt) {
-    line += `\n   💡 last jam ${formatRelativeTime(take.lastPlayedAt)}`;
+    details = `last played ${formatRelativeTime(take.lastPlayedAt)}`;
   }
-  return line;
+  return details ? `${summary}\n   ${details}` : summary;
 };
 
 const playSelectedTake = async (take) => {
