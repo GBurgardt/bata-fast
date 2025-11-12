@@ -2,7 +2,7 @@ import fs from "fs";
 import path from "path";
 import enquirer from "enquirer";
 
-import { PROCESSED_DIR, ROOT_DIR } from "../lib/paths.js";
+import { PROCESSED_DIR } from "../lib/paths.js";
 import {
   formatRelativeTime,
   formatTime,
@@ -33,7 +33,7 @@ export const browseCatalog = async () => {
       keepBrowsing = false;
       continue;
     }
-    keepBrowsing = await handleTake(selected);
+    await playSelectedTake(selected);
   }
 };
 
@@ -77,7 +77,7 @@ const loadTakes = async () => {
 
 const promptTakeSelection = async (takes) => {
   const selectPrompt = new Select({
-    message: `browse your catalog (${takes.length} takes)`,
+    message: `choose a take to play (${takes.length})`,
     choices: [
       ...takes.map((take) => ({
         name: formatTakeChoice(take),
@@ -111,110 +111,10 @@ const formatTakeChoice = (take) => {
   return `🥁 ${take.title} · ${durationLabel} · ${stemsLabel} · ${age}`;
 };
 
-const handleTake = async (take) => {
-  const actionPrompt = new Select({
-    message: `what now? (${take.title})`,
-    choices: [
-      {
-        name: take.combinedPath ? "play blended take" : "play drums",
-        value: "play-primary",
-        disabled: !take.primaryFile,
-      },
-      {
-        name: "choose a stem",
-        value: "choose-stem",
-        disabled: take.drumFiles.length === 0,
-      },
-      {
-        name: "show location",
-        value: "location",
-      },
-      {
-        name: "back",
-        value: "back",
-      },
-      {
-        name: "exit catalog",
-        value: "exit",
-      },
-    ],
-  });
-
-  const action = await actionPrompt.run();
-
-  switch (action) {
-    case "play-primary":
-      if (take.primaryFile) {
-        await playAudioFile(take.primaryFile);
-      }
-      return true;
-    case "choose-stem":
-      await promptStemSelection(take);
-      return true;
-    case "location":
-      showLocations(take);
-      return true;
-    case "back":
-      return true;
-    case "exit":
-    default:
-      return false;
-  }
-};
-
-const promptStemSelection = async (take) => {
-  const stems = [
-    ...(take.combinedPath
-      ? [
-          {
-            label: "blended take",
-            file: take.combinedPath,
-          },
-        ]
-      : []),
-    ...take.drumFiles.map((file) => ({
-      label: path.basename(file),
-      file,
-    })),
-  ];
-
-  if (!stems.length) {
-    voice.warn("no stems available for this take.");
+const playSelectedTake = async (take) => {
+  if (!take.primaryFile) {
+    voice.warn("no drum take ready for that selection.");
     return;
   }
-
-  const selectPrompt = new Select({
-    message: "choose a stem",
-    choices: [
-      ...stems.map((stem) => ({
-        name: stem.label,
-        value: stem.file,
-      })),
-      { name: "← back", value: "__back" },
-    ],
-  });
-
-  const selection = await selectPrompt.run();
-  if (selection === "__back") {
-    return;
-  }
-
-  await playAudioFile(selection);
-};
-
-const showLocations = (take) => {
-  const folder = path.relative(ROOT_DIR, take.folderPath);
-  voice.say(`folder: ${folder}`);
-  if (take.combinedPath) {
-    voice.hint(
-      `blended take: ${path.relative(ROOT_DIR, take.combinedPath)}`
-    );
-  }
-  if (take.drumFiles.length) {
-    voice.hint(
-      `stems: ${take.drumFiles
-        .map((file) => path.relative(ROOT_DIR, file))
-        .join(", ")}`
-    );
-  }
+  await playAudioFile(take.primaryFile);
 };
