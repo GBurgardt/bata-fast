@@ -22,6 +22,7 @@ import {
 import { combineDrumStems, playAudioFile } from "../lib/audio.js";
 import { collectDrumStems } from "../lib/catalog.js";
 import { logStage, logDebug, trimForLog } from "../lib/debug.js";
+import { recordTakePlayback } from "../lib/take-metadata.js";
 
 const { Input, Select, Confirm } = enquirer;
 
@@ -401,6 +402,11 @@ export const findDrumsFlow = async () => {
 
   voice.hint("playing it now… ctrl+c to stop anytime.");
   await playAudioFile(playbackPath);
+  try {
+    await recordTakePlayback(jobOutputDir);
+  } catch {
+    // ignoring metadata issues keeps the main flow smooth
+  }
 
   const displayPath = path.relative(ROOT_DIR, playbackPath);
   voice.success(`ready. saved to ${displayPath}.`);

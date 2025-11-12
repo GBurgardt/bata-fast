@@ -8,6 +8,7 @@ import { voice } from "./lib/ui.js";
 import { debugMode, logStage } from "./lib/debug.js";
 import { findDrumsFlow } from "./tools/find-drums.js";
 import { browseCatalog } from "./tools/browse-catalog.js";
+import { rememberTake } from "./tools/remember-take.js";
 
 const { Select } = enquirer;
 
@@ -17,6 +18,7 @@ const mainMenuPrompt = () =>
     choices: [
       { name: "find", message: "find new drums" },
       { name: "catalog", message: "browse my catalog" },
+      { name: "remember", message: "remember this take" },
       { name: "exit", message: "exit" },
     ],
   });
@@ -31,6 +33,9 @@ const runMenu = async () => {
         break;
       case "catalog":
         await browseCatalog();
+        break;
+      case "remember":
+        await rememberTake();
         break;
       case "exit":
       default:
@@ -47,6 +52,10 @@ const bootstrap = async () => {
     console.log(chalk.yellowBright("[MODO DEBUG ACTIVADO]"));
   }
   logStage("MAIN", "boot", { debugMode });
+  if (process.argv.includes("--remember")) {
+    await rememberTake();
+    return;
+  }
   await runMenu();
 };
 

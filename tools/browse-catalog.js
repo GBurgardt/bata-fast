@@ -1,25 +1,17 @@
-import fs from "fs";
-import path from "path";
 import enquirer from "enquirer";
 
-import { PROCESSED_DIR } from "../lib/paths.js";
 import {
   formatRelativeTime,
   formatTime,
-  tidyTitle,
   voice,
 } from "../lib/ui.js";
-import { collectDrumStems } from "../lib/catalog.js";
-import { getAudioDuration, playAudioFile } from "../lib/audio.js";
+import { loadTakes } from "../lib/takes.js";
+import { playAudioFile } from "../lib/audio.js";
+import { recordTakePlayback } from "../lib/take-metadata.js";
 
 const { Select } = enquirer;
 
 export const browseCatalog = async () => {
-  if (!fs.existsSync(PROCESSED_DIR)) {
-    voice.say("no processed takes yet. find one first.");
-    return;
-  }
-
   const takes = await loadTakes();
   if (!takes.length) {
     voice.say("no processed takes yet. find one first.");
@@ -35,44 +27,6 @@ export const browseCatalog = async () => {
     }
     await playSelectedTake(selected);
   }
-};
-
-const loadTakes = async () => {
-  const entries = fs
-    .readdirSync(PROCESSED_DIR, { withFileTypes: true })
-    .filter((dirent) => dirent.isDirectory());
-
-  const takes = await Promise.all(
-    entries.map(async (dirent) => {
-      const folderPath = path.join(PROCESSED_DIR, dirent.name);
-      const stats = fs.statSync(folderPath);
-      const drumFiles = collectDrumStems(folderPath);
-      const combinedPath = path.join(folderPath, "combined_drums.wav");
-      const hasCombined = fs.existsSync(combinedPath);
-      const primaryFile = hasCombined
-        ? combinedPath
-        : drumFiles[0] ?? null;
-      const durationSeconds = primaryFile
-        ? await getAudioDuration(primaryFile)
-        : null;
-      return {
-        id: dirent.name,
-        title: tidyTitle(dirent.name.replace(/_/g, " ")),
-        folderPath,
-        updatedAt: stats.mtime,
-        drumFiles,
-        combinedPath: hasCombined ? combinedPath : null,
-        primaryFile,
-        durationSeconds,
-      };
-    })
-  );
-
-  return takes
-    .filter((take) => take.primaryFile || take.drumFiles.length)
-    .sort(
-      (a, b) => b.updatedAt.getTime() - a.updatedAt.getTime()
-    );
 };
 
 const promptTakeSelection = async (takes) => {
@@ -108,7 +62,13 @@ const formatTakeChoice = (take) => {
     take.drumFiles.length === 1
       ? "1 stem"
       : `${take.drumFiles.length} stems`;
-  return `🥁 ${take.title} · ${durationLabel} · ${stemsLabel} · ${age}`;
+  let line = `🥁 ${take.title} · ${durationLabel} · ${stemsLabel} · ${age}`;
+  if (take.notes?.length) {
+    line += `\n   💡 ${take.notes.join(" · ")}`;
+  } else if (take.lastPlayedAt) {
+    line += `\n   💡 last jam ${formatRelativeTime(take.lastPlayedAt)}`;
+  }
+  return line;
 };
 
 const playSelectedTake = async (take) => {
@@ -117,4 +77,9 @@ const playSelectedTake = async (take) => {
     return;
   }
   await playAudioFile(take.primaryFile);
+  try {
+    await recordTakePlayback(take.folderPath);
+  } catch {
+    // ignore metadata errors to keep playback flowing
+  }
 };
