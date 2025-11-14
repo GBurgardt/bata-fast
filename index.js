@@ -18,6 +18,7 @@ const mainMenuPrompt = () =>
     choices: [
       { name: "find", message: "find new drums" },
       { name: "catalog", message: "browse my catalog" },
+      { name: "matches", message: "see my matches" },
       { name: "remember", message: "remember this take" },
       { name: "exit", message: "exit" },
     ],
@@ -33,6 +34,9 @@ const runMenu = async () => {
         break;
       case "catalog":
         await browseCatalog();
+        break;
+      case "matches":
+        await browseCatalog({ matchesOnly: true });
         break;
       case "remember":
         await rememberTake();

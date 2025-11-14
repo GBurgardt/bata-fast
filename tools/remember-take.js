@@ -3,6 +3,7 @@ import enquirer from "enquirer";
 import { voice, formatRelativeTime } from "../lib/ui.js";
 import { loadTakes } from "../lib/takes.js";
 import { appendTakeNotes } from "../lib/take-metadata.js";
+import { parseMatchInput } from "../lib/note-utils.js";
 
 const { Select, Input } = enquirer;
 
@@ -75,9 +76,5 @@ const promptNotes = async () => {
     message: "what did this groove unlock? (comma separates many)",
   });
   const value = await inputPrompt.run();
-  if (!value) return [];
-  return value
-    .split(",")
-    .map((item) => item.trim())
-    .filter(Boolean);
+  return parseMatchInput(value);
 };
